@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, CheckConstraint, Numeric
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, CheckConstraint, Numeric, inspect
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy_utils import database_exists, create_database
 
@@ -88,10 +88,20 @@ def create_tables():
         create_database(engine.url)
         print(f"Database '{engine.url.database}' created.")
 
-    # Create all tables
-    print("Creating tables...")
-    Base.metadata.create_all(engine)
-    print("All tables created successfully!")
+    # Check if tables exist
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    tables_to_create = [table.__tablename__ for table in [Customer, Order, OrderItem]]
+
+    # Identify which tables need to be created
+    new_tables = [table for table in tables_to_create if table not in existing_tables]
+
+    if new_tables:
+        print(f"Creating tables: {', '.join(new_tables)}")
+        Base.metadata.create_all(engine)
+        print("Tables created successfully!")
+    else:
+        print("All tables already exist. Skipping table creation.")
 
     return engine
 
