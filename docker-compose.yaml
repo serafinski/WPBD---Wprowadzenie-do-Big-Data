@@ -18,43 +18,52 @@ services:
     networks:
       - app-network
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.9.0
-    container_name: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
-      - zookeeper_log:/var/lib/zookeeper/log
-    networks:
-      - app-network
-
   kafka:
     image: confluentinc/cp-kafka:7.9.0
     container_name: kafka
-    depends_on:
-      - zookeeper
     ports:
       - "9092:9092"
       - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # KRaft settings
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://kafka:29093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # Other Kafka settings
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
     volumes:
       - kafka_data:/var/lib/kafka/data
     networks:
       - app-network
+    # This command formats the storage directories on first startup
+    command: >
+      bash -c '
+      if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+        echo "Creating Kafka storage directory"
+        mkdir -p /tmp/kraft-combined-logs
+        
+        echo "Creating kafka.properties file"
+        echo "node.id=${KAFKA_NODE_ID}" > /tmp/kafka.properties
+        echo "process.roles=${KAFKA_PROCESS_ROLES}" >> /tmp/kafka.properties
+        echo "controller.quorum.voters=${KAFKA_CONTROLLER_QUORUM_VOTERS}" >> /tmp/kafka.properties
+        
+        echo "Formatting Kafka storage"
+        kafka-storage format -t ${CLUSTER_ID} -c /tmp/kafka.properties
+      fi
+      
+      exec /etc/confluent/docker/run
+      '
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -66,7 +75,6 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
     networks:
       - app-network
 
@@ -100,6 +108,4 @@ networks:
 
 volumes:
   postgres_data:
-  zookeeper_data:
-  zookeeper_log:
   kafka_data:
