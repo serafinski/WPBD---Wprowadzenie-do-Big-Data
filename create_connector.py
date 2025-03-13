@@ -2,7 +2,6 @@ import json
 import requests
 import time
 import socket
-import argparse
 
 
 def wait_for_service(host, port, timeout=180):
@@ -59,6 +58,7 @@ def get_existing_connectors(connect_url):
 
 def create_connector(connect_url, connector_config):
     """Create a new connector using the Kafka Connect REST API."""
+
     # Check if connector already exists
     existing_connectors = get_existing_connectors(connect_url)
     connector_name = connector_config['name']
@@ -117,55 +117,28 @@ def get_connector_status(connect_url, connector_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Create a Debezium PostgreSQL connector.')
-    parser.add_argument('--connect-host', default='localhost', help='Kafka Connect host')
-    parser.add_argument('--connect-port', default=8083, type=int, help='Kafka Connect port')
-    parser.add_argument('--pg-host', default='localhost', help='PostgreSQL host')
-    parser.add_argument('--pg-port', default=5432, type=int, help='PostgreSQL port')
-    parser.add_argument('--config-file', default=None, help='JSON file with connector configuration')
-    args = parser.parse_args()
+    # Constans
+    connect_host = 'localhost'
+    connect_port = 8083
+    pg_host = 'localhost'
+    pg_port = 5432
+    config_file = 'config/connector_config.json'
 
-    # Default connector configuration
-    default_config = {
-        "name": "postgres-connector",
-        "config": {
-            "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-            "tasks.max": "1",
-            "database.hostname": "postgres_db",
-            "database.port": "5432",
-            "database.user": "postgres",
-            "database.password": "password",
-            "database.dbname": "postgres",
-            "database.server.name": "postgres_server",
-            "topic.prefix": "postgres_server",
-            "schema.include.list": "public",
-            "table.include.list": "public.customers,public.orders,public.order_items",
-            "plugin.name": "decoderbufs",
-            "transforms": "unwrap",
-            "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-            "transforms.unwrap.drop.tombstones": "false",
-            "transforms.unwrap.delete.handling.mode": "rewrite",
-            "transforms.unwrap.add.fields": "op,table,lsn,source.ts_ms"
-        }
-    }
+    # Ładowanie konfiguracji z pliku
+    try:
+        with open(config_file, 'r') as f:
+            connector_config = json.load(f)
+        print(f"Loaded configuration from {config_file}")
+    except Exception as e:
+        print(f"Error loading config file {config_file}: {e}")
+        print("Exiting due to missing or invalid configuration file.")
+        return False
 
-    # Load config from file if provided
-    if args.config_file:
-        try:
-            with open(args.config_file, 'r') as f:
-                connector_config = json.load(f)
-            print(f"Loaded configuration from {args.config_file}")
-        except Exception as e:
-            print(f"Error loading config file: {e}")
-            connector_config = default_config
-    else:
-        connector_config = default_config
-
-    connect_url = f"http://{args.connect_host}:{args.connect_port}"
+    connect_url = f"http://{connect_host}:{connect_port}"
 
     # Wait for services to be ready
-    print(f"Checking if PostgreSQL is available at {args.pg_host}:{args.pg_port}...")
-    if not check_postgres(args.pg_host, args.pg_port):
+    print(f"Checking if PostgreSQL is available at {pg_host}:{pg_port}...")
+    if not check_postgres(pg_host, pg_port):
         print("PostgreSQL is not available. Exiting.")
         return False
 
@@ -188,7 +161,7 @@ def main():
             if 'state' in status.get('connector', {}):
                 print(f"Connector state: {status['connector']['state']}")
 
-            # Check tasks status
+            # Tasks status
             tasks = status.get('tasks', [])
             if tasks:
                 for i, task in enumerate(tasks):

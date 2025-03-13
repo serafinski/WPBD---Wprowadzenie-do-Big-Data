@@ -5,8 +5,6 @@ import random
 import argparse
 import decimal
 
-# Update this import to match your table creation script filename
-# If your table creation script is named create_tables.py:
 from create_tables import Customer, Order, OrderItem, create_tables
 
 # Initialize Faker to generate realistic looking data
@@ -22,6 +20,7 @@ def generate_and_insert_data(num_customers=100, max_orders_per_customer=5, max_i
         max_orders_per_customer (int): Maximum number of orders per customer
         max_items_per_order (int): Maximum number of items per order
     """
+
     # Create engine and get a session
     engine = create_tables()  # This ensures tables exist
     Session = sessionmaker(bind=engine)
@@ -168,7 +167,9 @@ def generate_and_insert_data(num_customers=100, max_orders_per_customer=5, max_i
 
                 # Add the order to the session
                 session.add(order)
-                session.flush()  # This assigns the order_id
+
+                # This assigns the order_id
+                session.flush()
 
                 # Set the order_id for each item and add them to the session
                 for item in order_items:
