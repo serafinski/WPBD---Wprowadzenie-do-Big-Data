@@ -12,7 +12,7 @@ def wait_for_service(host, port, timeout=180):
             with socket.create_connection((host, port), timeout=1):
                 print(f"Service at {host}:{port} is available")
                 return True
-        except (socket.timeout, ConnectionRefusedError) as e:
+        except (socket.timeout, ConnectionRefusedError):
             if time.time() - start_time > timeout:
                 print(f"Timeout waiting for {host}:{port}")
                 return False
