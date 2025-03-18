@@ -2,7 +2,7 @@ import json
 import requests
 import time
 import socket
-
+import os
 
 def wait_for_service(host, port, timeout=180):
     """Wait for a service to be available at host:port."""
@@ -74,7 +74,8 @@ def create_connector(connect_url, connector_config):
                 print(f"Current state: {status['connector']['state']}")
 
             # Option to delete existing connector
-            if input(f"Do you want to delete the existing connector '{connector_name}'? (y/n): ").lower() == 'y':
+            delete_existing = os.environ.get('DELETE_EXISTING_CONNECTOR', 'false').lower() == 'true'
+            if delete_existing:
                 print(f"Deleting connector '{connector_name}'...")
                 delete_response = requests.delete(f"{connect_url}/connectors/{connector_name}")
                 if delete_response.status_code in (204, 200):
@@ -117,14 +118,14 @@ def get_connector_status(connect_url, connector_name):
 
 
 def main():
-    # Constans
-    connect_host = 'localhost'
-    connect_port = 8083
-    pg_host = 'localhost'
-    pg_port = 5432
-    config_file = 'config/connector_config.json'
+    # Constants - Use environment variables with defaults for Docker
+    connect_host = os.environ.get('CONNECT_HOST', 'debezium')
+    connect_port = int(os.environ.get('CONNECT_PORT', '8083'))
+    pg_host = os.environ.get('PG_HOST', 'postgres')
+    pg_port = int(os.environ.get('PG_PORT', '5432'))
+    config_file = os.environ.get('CONFIG_FILE', '/app/config/connector_config.json')
 
-    # Ładowanie konfiguracji z pliku
+    # Load configuration from file
     try:
         with open(config_file, 'r') as f:
             connector_config = json.load(f)

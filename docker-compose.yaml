@@ -165,6 +165,25 @@ services:
     networks:
       - app-network
 
+  connector-setup:
+    build:
+      context: ./connector
+      dockerfile: Dockerfile
+    container_name: connector-setup
+    depends_on:
+      - debezium
+      - postgres
+    volumes:
+      - ./connector-setup:/app
+    networks:
+      - app-network
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for services to be available...' &&
+      python /app/create_connector.py &&
+      echo 'Connector setup complete!'
+      "
+
 networks:
   app-network:
     driver: bridge
