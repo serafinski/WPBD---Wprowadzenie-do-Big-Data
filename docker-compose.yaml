@@ -160,7 +160,6 @@ services:
       - '7077:7077'
     volumes:
       - ./spark/scripts:/opt/bitnami/spark/scripts
-      - ./spark/data:/opt/bitnami/spark/data
       - ./spark/checkpoints:/opt/bitnami/spark/checkpoints
     networks:
       - app-network
