@@ -1,29 +1,7 @@
 import json
 import requests
 import time
-import socket
 import os
-
-def wait_for_service(host, port, timeout=180):
-    """Wait for a service to be available at host:port."""
-    start_time = time.time()
-    while True:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                print(f"Service at {host}:{port} is available")
-                return True
-        except (socket.timeout, ConnectionRefusedError):
-            if time.time() - start_time > timeout:
-                print(f"Timeout waiting for {host}:{port}")
-                return False
-            print(f"Service at {host}:{port} not yet available, retrying...")
-            time.sleep(5)
-
-
-def check_postgres(host, port, timeout=180):
-    """Check if PostgreSQL is running by attempting to connect to it."""
-    return wait_for_service(host, port, timeout)
-
 
 def check_kafka_connect(url, timeout=180):
     """Check if Kafka Connect REST API is available."""
@@ -121,8 +99,6 @@ def main():
     # Constants - Use environment variables with defaults for Docker
     connect_host = os.environ.get('CONNECT_HOST', 'debezium')
     connect_port = int(os.environ.get('CONNECT_PORT', '8083'))
-    pg_host = os.environ.get('PG_HOST', 'postgres')
-    pg_port = int(os.environ.get('PG_PORT', '5432'))
     config_file = os.environ.get('CONFIG_FILE', '/app/config/connector_config.json')
 
     # Load configuration from file
@@ -136,12 +112,6 @@ def main():
         return False
 
     connect_url = f"http://{connect_host}:{connect_port}"
-
-    # Wait for services to be ready
-    print(f"Checking if PostgreSQL is available at {pg_host}:{pg_port}...")
-    if not check_postgres(pg_host, pg_port):
-        print("PostgreSQL is not available. Exiting.")
-        return False
 
     print(f"Checking if Kafka Connect is available at {connect_url}...")
     if not check_kafka_connect(connect_url):

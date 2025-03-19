@@ -102,6 +102,12 @@ services:
       # Automatically register connectors from the mounted config directory
       CONNECT_REST_ADVERTISED_HOST_NAME: "debezium"
       CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: "All"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     networks:
       - app-network
 
@@ -166,19 +172,21 @@ services:
 
   connector-setup:
     build:
-      context: ./connector
+      context: ./connector-setup
       dockerfile: Dockerfile
     container_name: connector-setup
     depends_on:
-      - debezium
-      - postgres
+      debezium:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     volumes:
       - ./connector-setup:/app
     networks:
       - app-network
     entrypoint: >
       /bin/sh -c "
-      echo 'Waiting for services to be available...' &&
+      echo 'Starting connector setup...' &&
       python /app/create_connector.py &&
       echo 'Connector setup complete!'
       "
