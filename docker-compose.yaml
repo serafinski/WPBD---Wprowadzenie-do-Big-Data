@@ -1,3 +1,5 @@
+# TODO: Add Web UI for pyspark?
+
 services:
   postgres:
     image: quay.io/debezium/postgres:15

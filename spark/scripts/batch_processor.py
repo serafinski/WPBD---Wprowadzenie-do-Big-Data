@@ -1,30 +1,36 @@
+# This follows minio-pyspark-minio architecture
+
 # This is for batch layer, which is responsible for processing the data in the data lake and generating analytics
 
 # docker exec spark /opt/bitnami/spark/scripts/jobs.sh batch
 
+import sys
+import binascii
 from pyspark.sql import SparkSession
+from pyspark.sql.types import DoubleType
 from pyspark.sql.functions import (
     col, sum, count, avg, expr, to_date, year, 
     datediff, when, lit, max as spark_max,
-    to_timestamp, current_timestamp, countDistinct
+    to_timestamp, current_timestamp, countDistinct, udf
 )
 
+# We are using AWS/Hadoop because MinIO requires it - it's an S3-compatible storage
 def create_spark_session():
     """Create a Spark session with appropriate configurations."""
     return (SparkSession.builder
-            .appName("E-commerce Batch Analytics")
+            .appName("Batch Analytics")
             .config("spark.sql.streaming.checkpointLocation", "/opt/bitnami/spark/checkpoints")
-            # Configure MinIO S3 connectivity - updated to match streaming processor
+            # No Kafka dependencies - since not needed for batch processing
             .config("spark.jars.packages", 
-                    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,"
                     "org.apache.hadoop:hadoop-aws:3.3.4,"
                     "com.amazonaws:aws-java-sdk-bundle:1.12.595")
             .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
             .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
             .config("spark.hadoop.fs.s3a.secret.key", "minioadmin")
+            # Path style access is required for MinIO
             .config("spark.hadoop.fs.s3a.path.style.access", "true")
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-            # Add these configs to avoid S3A FileSystem problems
+            # Explicitly set the credentials provider to avoid warnings
             .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
             .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
             .getOrCreate())
@@ -34,6 +40,7 @@ def load_data_from_datalake(spark, entity_name, data_lake_path):
     full_path = f"{data_lake_path}/{entity_name}"
     
     # Read the data and filter out deleted records
+    # This gives only current active records
     df = (spark.read
           .format("parquet")
           .load(full_path)
@@ -41,6 +48,8 @@ def load_data_from_datalake(spark, entity_name, data_lake_path):
     
     return df
 
+# price x quantity x (1 - discount)
+# This is a simple calculation to get the total line item price
 def analyze_sales_by_period(orders_df, order_items_df):
     """Analyze sales metrics by different time periods."""
     # Join orders with order items
@@ -89,6 +98,7 @@ def analyze_sales_by_period(orders_df, order_items_df):
         "monthly": monthly_sales
     }
 
+# Segment customers based on registration date and order activity
 def analyze_customer_cohorts(customers_df, orders_df):
     """Analyze customer cohorts based on registration date."""
     # Create cohort based on registration month
@@ -98,6 +108,8 @@ def analyze_customer_cohorts(customers_df, orders_df):
                          .select("customer_id", "registration_cohort"))
     
     # Join with orders
+    # Used to analyze how different cohorts behave over time
+    # This counts the number of active customers and total spent per cohort per month
     cohort_activity = (orders_df
                       .join(cohorted_customers, "customer_id")
                       .withColumn("order_month", 
@@ -110,6 +122,8 @@ def analyze_customer_cohorts(customers_df, orders_df):
     
     return cohort_activity
 
+# Calculate metrics for each product - total units sold, total revenue, avg discount, number of orders containing the product
+# Order by total revenue descending
 def analyze_product_performance(order_items_df):
     """Analyze product performance metrics."""
     return (order_items_df
@@ -122,6 +136,12 @@ def analyze_product_performance(order_items_df):
             )
             .orderBy(col("total_revenue").desc()))
 
+# Calculate RFM (Recency, Frequency, Monetary) metrics for customer segmentation
+# Recency: Days since last order
+# Frequency: Number of orders
+# Monetary: Total amount spent
+# Assign scores (1-3) based on R, F, M dimensions based on tresholds
+# Combine scores to create RFM score - based on which customers are segmented
 def calculate_customer_recency_frequency_monetary(customers_df, orders_df):
     """
     Calculate RFM (Recency, Frequency, Monetary) metrics for customer segmentation.
@@ -129,7 +149,7 @@ def calculate_customer_recency_frequency_monetary(customers_df, orders_df):
     This is a more advanced analysis to segment customers based on their
     purchasing behavior.
     """
-    # Get the most recent date in the orders dataset
+    # Get the most recent date in the orders dataset - used as a reference point
     max_date = orders_df.select(spark_max("order_date")).first()[0]
     
     # Calculate RFM metrics per customer
@@ -173,6 +193,7 @@ def calculate_customer_recency_frequency_monetary(customers_df, orders_df):
         "customer_id"
     )
 
+# Identify frequently co-purchased products
 def analyze_product_affinity(order_items_df):
     """
     Perform product affinity analysis to find frequently co-purchased products.
@@ -186,6 +207,7 @@ def analyze_product_affinity(order_items_df):
                     .join(
                         order_items_df.select("order_id", "product_id", "product_name").alias("b"),
                         (col("a.order_id") == col("b.order_id")) & 
+                        # Ensure pair is only counted once
                         (col("a.product_id") < col("b.product_id"))
                     )
                     .select(
@@ -226,21 +248,19 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
     Returns:
         bool: True if processing succeeded, False otherwise
     """
-    from pyspark.sql.functions import expr, udf
-    from pyspark.sql.types import DoubleType
-    import binascii
-    
-    # Create a UDF to directly convert PostgreSQL binary to numeric values
+
+    # Create a UDF (User-Defined Function) to directly convert PostgreSQL binary to numeric values
     @udf(returnType=DoubleType())
     def pg_numeric_to_double(binary_data):
         if binary_data is None:
             return None
         
         try:
-            # Convert to hex for processing
+            # Convert binary to hex for processing
             hex_str = binascii.hexlify(binary_data).decode('utf-8')
             
-            # Handle different hex lengths
+            # TODO: FIND A BETTER SOLUTION FOR THIS
+            # Interpret the bytes according to PostgreSQL format
             if len(hex_str) == 6:  # 3 bytes: xxxxxx
                 high = int(hex_str[0:2], 16)
                 mid = int(hex_str[2:4], 16)
@@ -267,12 +287,9 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
     print(f"Processing {entity_name} data from {full_path}...")
     
     try:
-        # Read the raw data
+        # Read the raw data from MinIO
         try:
             df = spark.read.format("parquet").load(full_path)
-            if df.count() == 0:
-                print(f"No data found in {full_path}. Skipping processing.")
-                return False
         except Exception as e:
             print(f"Error reading data from {full_path}: {str(e)}")
             return False
@@ -292,7 +309,7 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
             to_timestamp(col("__source_ts_ms") / 1000)
         )
         
-        # Convert timestamp fields if present
+        # Convert timestamps fields if present
         if "registration_date" in df.columns:
             processed_df = processed_df.withColumn(
                 "registration_date", 
@@ -311,7 +328,7 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
                 to_timestamp(col("order_date") / 1000000)
             )
         
-        # Handle binary fields with direct UDF conversion
+        # Handle binary fields with previously defined UDF
         if entity_name == "orders" and "total_amount" in df.columns:
             processed_df = processed_df.withColumn(
                 "total_amount",
@@ -334,6 +351,7 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
         # Write to MinIO in Parquet format
         (processed_df
          .write
+        # TODO: Deal with incremental processing, so we don't process entire data every time
          .mode("overwrite")
          .format("parquet")
          .partitionBy("__op")
@@ -370,13 +388,20 @@ def main():
         print("Processing raw data to processed format...")
         entities = ["customers", "orders", "order_items"]
         processed_entities = []
+        all_successful = True
         
         for entity in entities:
             success = process_raw_data(spark, entity, data_lake_raw_path, data_lake_processed_path)
             if success:
                 processed_entities.append(entity)
             else:
-                print(f"WARNING: Failed to process {entity}. Skipping it in analytics.")
+                print(f"ERROR: Failed to process {entity}.")
+                all_successful = False
+
+        # Check if all required entities were processed successfully
+        if not all_successful:
+            print("ERROR: Not all required entities were processed successfully.")
+            sys.exit(1)
         
         # Now load the processed data for analytics
         dataframes = {}
@@ -387,19 +412,8 @@ def main():
                 print(f"Successfully loaded {entity} data with {dataframes[entity].count()} records")
             except Exception as e:
                 print(f"ERROR: Failed to load {entity} data: {str(e)}")
-                dataframes[entity] = None
-        
-        # Check if we have all required dataframes
-        if "customers" not in dataframes or dataframes["customers"] is None:
-            print("ERROR: Customers data is missing. Cannot proceed with customer analytics.")
-        
-        if "orders" not in dataframes or dataframes["orders"] is None:
-            print("ERROR: Orders data is missing. Cannot proceed with order analytics.")
-        
-        if "order_items" not in dataframes or dataframes["order_items"] is None:
-            print("ERROR: Order items data is missing. Cannot proceed with product analytics.")
-        
-        # Perform analytics only if we have the necessary data
+                print("Cannot proceed with analytics due to data loading failure.")
+                sys.exit(1)
         
         # Sales analytics (requires orders and order_items)
         if "orders" in dataframes and dataframes["orders"] is not None and "order_items" in dataframes and dataframes["order_items"] is not None:
@@ -423,7 +437,8 @@ def main():
             
             save_analytics_results(sales_by_status, "sales_by_status", analytics_output_path)
         else:
-            print("Skipping sales analytics due to missing data")
+            print("ERROR: Failed to generate sales analytics due to missing data")
+            sys.exit(1)
             
         # Customer analytics (requires customers and orders)
         if "customers" in dataframes and dataframes["customers"] is not None and "orders" in dataframes and dataframes["orders"] is not None:
@@ -444,7 +459,8 @@ def main():
             
             save_analytics_results(segment_distribution, "customer_segments", analytics_output_path)
         else:
-            print("Skipping customer analytics due to missing data")
+            print("ERROR: Failed to generate customer analytics due to missing data")
+            sys.exit(1)
             
         # Product analytics (requires order_items)
         if "order_items" in dataframes and dataframes["order_items"] is not None:
@@ -456,7 +472,8 @@ def main():
             product_affinity = analyze_product_affinity(dataframes["order_items"])
             save_analytics_results(product_affinity, "product_affinity", analytics_output_path)
         else:
-            print("Skipping product analytics due to missing data")
+            print("ERROR: Failed to generate product analytics due to missing data")
+            sys.exit(1)
         
         print("Analytics processing complete!")
         
