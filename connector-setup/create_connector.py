@@ -42,7 +42,7 @@ def create_connector(connect_url, connector_config):
     connector_name = connector_config['name']
 
     if connector_name in existing_connectors:
-        print(f"Connector '{connector_name}' already exists")
+        print(f"Connector '{connector_name}' already exists. Skipping creation.")
 
         # Check connector status
         response = requests.get(f"{connect_url}/connectors/{connector_name}/status")
@@ -50,22 +50,8 @@ def create_connector(connect_url, connector_config):
             status = response.json()
             if 'state' in status.get('connector', {}):
                 print(f"Current state: {status['connector']['state']}")
-
-            # Option to delete existing connector
-            delete_existing = os.environ.get('DELETE_EXISTING_CONNECTOR', 'false').lower() == 'true'
-            if delete_existing:
-                print(f"Deleting connector '{connector_name}'...")
-                delete_response = requests.delete(f"{connect_url}/connectors/{connector_name}")
-                if delete_response.status_code in (204, 200):
-                    print(f"Connector '{connector_name}' deleted successfully")
-                else:
-                    print(f"Failed to delete connector: {delete_response.text}")
-                    return False
-            else:
-                return False
-        else:
-            print(f"Failed to get connector status: {response.text}")
-            return False
+        
+        return True
 
     # Create the connector
     print(f"Creating connector '{connector_name}'...")
