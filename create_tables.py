@@ -2,7 +2,6 @@ import datetime
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, CheckConstraint, Numeric, inspect
 from sqlalchemy.orm import relationship, declarative_base
-from sqlalchemy_utils import database_exists, create_database
 
 # Define the database URL
 DB_URL = "postgresql+pg8000://postgres:password@localhost:5432/postgres"
@@ -24,8 +23,8 @@ class Customer(Base):
     city = Column(String(50))
     state = Column(String(50))
     zip_code = Column(String(20))
-    registration_date = Column(DateTime, default=datetime.datetime.utcnow)
-    last_update = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    registration_date = Column(DateTime, default=datetime.datetime.now)
+    last_update = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     # Relationship with Order
     orders = relationship("Order", back_populates="customer")
@@ -39,7 +38,7 @@ class Order(Base):
 
     order_id = Column(Integer, primary_key=True)
     customer_id = Column(Integer, ForeignKey('customers.customer_id'))
-    order_date = Column(DateTime, default=datetime.datetime.utcnow)
+    order_date = Column(DateTime, default=datetime.datetime.now)
     status = Column(String(20),
                     CheckConstraint("status IN ('pending', 'processing', 'shipped', 'delivered', 'cancelled')"),
                     default='pending')
@@ -49,7 +48,7 @@ class Order(Base):
     shipping_city = Column(String(50))
     shipping_state = Column(String(50))
     shipping_zip = Column(String(20))
-    last_update = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    last_update = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     # Relationships
     customer = relationship("Customer", back_populates="orders")
@@ -69,7 +68,7 @@ class OrderItem(Base):
     quantity = Column(Integer, CheckConstraint("quantity > 0"), nullable=False)
     unit_price = Column(Numeric(10, 2), nullable=False)
     discount = Column(Numeric(5, 2), default=0.00)
-    last_update = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    last_update = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     # Relationship with Order
     order = relationship("Order", back_populates="items")
@@ -79,14 +78,8 @@ class OrderItem(Base):
 
 
 def create_tables():
-    """Create database and tables if they don't exist."""
+    """Create tables if they don't exist."""
     engine = create_engine(DB_URL)
-
-    # Create database if it doesn't exist
-    if not database_exists(engine.url):
-        print(f"Creating database '{engine.url.database}'...")
-        create_database(engine.url)
-        print(f"Database '{engine.url.database}' created.")
 
     # Check if tables exist
     inspector = inspect(engine)
