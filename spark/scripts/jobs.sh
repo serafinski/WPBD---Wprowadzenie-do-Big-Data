@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# docker exec spark chmod +x /opt/bitnami/spark/scripts/jobs.sh
-
 # This script submits PySpark jobs to process data and store it in MinIO
+# -- master local[*] - Run Spark in local mode using all available cores
+# -- packages - Add the required packages to the classpath
+# -- conf - Set Spark configuration properties
 
 # Set environment variables
 SPARK_HOME=/opt/bitnami/spark
