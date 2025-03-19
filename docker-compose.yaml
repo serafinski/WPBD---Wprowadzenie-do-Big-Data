@@ -25,7 +25,6 @@ services:
       - "9092:9092"
       - "29092:29092"
     environment:
-      
       # KRaft settings
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: "broker,controller"
@@ -111,7 +110,6 @@ services:
     networks:
       - app-network
 
-    # Add MinIO service
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -132,7 +130,7 @@ services:
     networks:
       - app-network
 
-  # MinIO Client for bucket setup
+  # For initial setup of MinIO bucket
   mc:
     image: minio/mc:latest
     container_name: mc
@@ -170,6 +168,7 @@ services:
     networks:
       - app-network
 
+  # For initial setup of Debezium connector
   connector-setup:
     build:
       context: ./connector-setup
