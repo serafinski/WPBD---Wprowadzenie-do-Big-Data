@@ -25,3 +25,7 @@ if [ -d "$FULL_PATH" ]; then
 else
     echo "Folder not found: $FULL_PATH"
 fi
+
+# Clean up docker volumes
+echo "Cleaning up docker volumes..."
+docker volume prune -a -f
