@@ -3,6 +3,12 @@
 
 # docker exec spark /opt/bitnami/spark/scripts/jobs.sh streaming
 
+import os
+import time
+import json
+import uuid
+
+from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp, lit, when, current_timestamp
 from pyspark.sql.types import (
@@ -15,7 +21,6 @@ def create_spark_session():
     """Create a Spark session with appropriate configurations."""
     return (SparkSession.builder
             .appName("CDC to MinIO Processor")
-            .config("spark.sql.streaming.checkpointLocation", "/opt/bitnami/spark/checkpoints")
             .config("spark.jars.packages", 
                     "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,"
                     "org.apache.hadoop:hadoop-aws:3.3.4,"
@@ -150,15 +155,63 @@ def process_and_save_to_minio(df, entity_name):
     
     # Define the MinIO output path
     s3_path = f"s3a://datalake/raw/{entity_name}"
-    checkpoint_path = f"/opt/bitnami/spark/checkpoints/{entity_name}"
     
-    # Write to MinIO in Parquet format, partitioned by operation type
+    # Create a unique checkpoint path for each query to avoid conflicts
+    query_id = str(uuid.uuid4())[:8]  # Use a unique ID for each stream
+    checkpoint_path = f"/opt/bitnami/spark/checkpoints/{entity_name}_{query_id}"
+    
+    # Create a tracking file to monitor data written to data lake
+    tracking_dir = "/opt/bitnami/spark/tracking"
+    os.makedirs(tracking_dir, exist_ok=True)
+    tracking_file = f"{tracking_dir}/{entity_name}_write_tracker.json"
+    
+    # Initialize tracking file if it doesn't exist
+    if not os.path.exists(tracking_file):
+        with open(tracking_file, 'w') as f:
+            json.dump({"last_batch_id": -1, "total_records_written": 0}, f)
+    
+    # Add a foreach batch to monitor progress and track writes to data lake
+    def process_batch(batch_df, batch_id):
+        # Count records in the batch
+        row_count = batch_df.count()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if row_count > 0:
+            # Actually write the data to MinIO
+            # Partition by operation type
+            (batch_df
+             .write
+             .partitionBy("__op")
+             .mode("append")
+             .parquet(s3_path))
+            
+            # Update tracking information
+            tracking_info = {"last_batch_id": batch_id, "total_records_written": 0}
+            if os.path.exists(tracking_file):
+                with open(tracking_file, 'r') as f:
+                    try:
+                        tracking_info = json.load(f)
+                    except:
+                        pass
+            
+            # Update total count
+            tracking_info["last_batch_id"] = batch_id
+            tracking_info["total_records_written"] += row_count
+            
+            # Save tracking info
+            with open(tracking_file, 'w') as f:
+                json.dump(tracking_info, f)
+            
+            # Log the write operation
+            print(f"[{timestamp}] WROTE TO DATALAKE: {row_count} {entity_name} records (batch #{batch_id})")
+            print(f"[{timestamp}] Total {entity_name} records in data lake: {tracking_info['total_records_written']}")
+            print(f"[{timestamp}] Data location: {s3_path}/__op=*")
+    
+    # Write to MinIO in Parquet format using foreachBatch
     query = (processed_df
              .writeStream
              .outputMode("append")
-             .format("parquet")
-             .partitionBy("__op")  # Partition by operation type
-             .option("path", s3_path)
+             .foreachBatch(process_batch)
              .option("checkpointLocation", checkpoint_path)
              .start())
     
@@ -169,7 +222,10 @@ def main():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
     
+    print("\n" + "="*80)
     print("PySpark MinIO Data Processor started!")
+    print("="*80 + "\n")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Initializing streaming jobs...")
     
     # Define schemas
     schemas = define_schemas()
@@ -184,12 +240,45 @@ def main():
     # Create streaming queries for each entity
     queries = []
     for entity, topic in topics.items():
-        print(f"Setting up streaming for {entity} from topic {topic}")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Setting up streaming for {entity} from topic {topic}")
         df = read_kafka_topic(spark, topic, schemas[entity])
         query = process_and_save_to_minio(df, entity)
         queries.append(query)
     
-    # Wait for any of the queries to terminate
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] All streaming jobs initialized successfully")
+    print("\nMonitoring for data processing (press Ctrl+C to stop)...\n")
+    
+    # Wait for streaming queries to terminate while displaying simplified status
+    try:
+        while True:
+            all_active = True
+            active_streams = []
+            
+            for i, query in enumerate(queries):
+                entity = list(topics.keys())[i]
+                
+                if query.isActive:
+                    active_streams.append(entity)
+                else:
+                    all_active = False
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Stream for {entity} has terminated")
+            
+            if not all_active:
+                print("One or more streams have terminated. Exiting...")
+                break
+            
+            # Print a simple heartbeat
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] Heartbeat: All streams active, waiting for data... ({', '.join(active_streams)})")
+                
+            # Sleep for 15 seconds before checking again (reduced from 30)
+            time.sleep(15)
+            
+    except KeyboardInterrupt:
+        for query in queries:
+            query.stop()
+    
+    # In case we don't catch through the loop
     spark.streams.awaitAnyTermination()
 
 if __name__ == "__main__":
