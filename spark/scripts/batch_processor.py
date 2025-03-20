@@ -5,7 +5,6 @@
 # docker exec spark /opt/bitnami/spark/scripts/jobs.sh batch
 
 import sys
-import binascii
 from pyspark.sql import SparkSession
 from pyspark.sql.types import DoubleType
 from pyspark.sql.functions import (
@@ -256,29 +255,13 @@ def process_raw_data(spark, entity_name, raw_path, processed_path):
             return None
         
         try:
-            # Convert binary to hex for processing
-            hex_str = binascii.hexlify(binary_data).decode('utf-8')
+            # Convert binary data to integer based on number of bytes
+            value = int.from_bytes(binary_data, byteorder='big')
             
-            # TODO: FIND A BETTER SOLUTION FOR THIS
-            # Interpret the bytes according to PostgreSQL format
-            if len(hex_str) == 6:  # 3 bytes: xxxxxx
-                high = int(hex_str[0:2], 16)
-                mid = int(hex_str[2:4], 16)
-                low = int(hex_str[4:6], 16)
-                value = (high * 65536 + mid * 256 + low) / 100.0
-                return value
-            elif len(hex_str) == 4:  # 2 bytes: xxxx
-                high = int(hex_str[0:2], 16)
-                low = int(hex_str[2:4], 16)
-                value = (high * 256 + low) / 100.0
-                return value
-            elif len(hex_str) == 2:  # 1 byte: xx
-                value = int(hex_str, 16) / 100.0
-                return value
-            else:
-                return None
-        
-        except Exception:
+            # Apply fixed scaling factor for 2 decimal places
+            return value / 100.0
+        except Exception as e:
+            print(f"Error converting numeric: {e}")
             return None
     
     full_path = f"{raw_path}/{entity_name}"
