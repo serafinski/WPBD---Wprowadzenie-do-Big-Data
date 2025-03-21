@@ -26,6 +26,7 @@ else
     echo "Folder not found: $FULL_PATH"
 fi
 
+docker-compose down
 # Clean up docker volumes
 echo "Cleaning up docker volumes..."
 docker volume prune -a -f

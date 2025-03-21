@@ -5,12 +5,13 @@
 # docker exec spark /opt/bitnami/spark/scripts/jobs.sh batch
 
 import sys
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import DoubleType
 from pyspark.sql.functions import (
     col, sum, count, avg, expr, to_date, year, 
     datediff, when, lit, max as spark_max,
-    to_timestamp, current_timestamp, countDistinct, udf
+    to_timestamp, current_timestamp, countDistinct, udf,
+    row_number, desc
 )
 
 # We are using AWS/Hadoop because MinIO requires it - it's an S3-compatible storage
@@ -35,17 +36,267 @@ def create_spark_session():
             .getOrCreate())
 
 def load_data_from_datalake(spark, entity_name, data_lake_path):
-    """Load the latest data from the data lake."""
+    """
+    Load the latest data from the data lake.
+    This enhanced version properly handles CDC data with improved debugging.
+    """
     full_path = f"{data_lake_path}/{entity_name}"
     
-    # Read the data and filter out deleted records
-    # This gives only current active records
-    df = (spark.read
-          .format("parquet")
-          .load(full_path)
-          .filter(col("is_deleted") == False))
+    try:
+        # Read all the processed data
+        all_data = spark.read.format("parquet").load(full_path)
+        initial_count = all_data.count()
+        print(f"DEBUG: Initial {entity_name} record count from data lake: {initial_count}")
+        
+        # Identify primary key field name
+        # For CDC operations, each entity has a specific ID field
+        primary_key_field = None
+        if entity_name == "customers":
+            primary_key_field = "customer_id"
+        elif entity_name == "orders":
+            primary_key_field = "order_id"
+        elif entity_name == "order_items":
+            # For order items, we need both fields for a composite key
+            order_items_count = all_data.select("order_id", "product_id").distinct().count()
+            print(f"DEBUG: Distinct order_items by composite key: {order_items_count}")
+            
+            # Define window for order_items based on composite key
+            window_spec = Window.partitionBy("order_id", "product_id").orderBy(desc("__source_ts_ms"))
+            
+            # First get just the latest version of each order_item
+            latest_records = all_data.withColumn("row_num", row_number().over(window_spec))
+            latest_records = latest_records.filter(col("row_num") == 1).drop("row_num")
+            
+            # Filter out deleted records
+            active_records = latest_records.filter(col("is_deleted") == False)
+            
+            active_count = active_records.count()
+            print(f"Loaded {active_count} active {entity_name} records (after filtering duplicates and deleted records)")
+            
+            return active_records
+        
+        if not primary_key_field:
+            raise ValueError(f"Unsupported entity type: {entity_name}")
+        
+        print(f"DEBUG: Using primary key field: {primary_key_field} for {entity_name}")
+        
+        # Show distinct primary key count
+        distinct_keys = all_data.select(primary_key_field).distinct().count()
+        print(f"DEBUG: Distinct {primary_key_field} count: {distinct_keys}")
+        
+        # Define a window to get the latest version of each record
+        window_spec = Window.partitionBy(primary_key_field).orderBy(desc("__source_ts_ms"))
+        
+        # Add row number within each partition
+        with_row_nums = all_data.withColumn("row_num", row_number().over(window_spec))
+        
+        # Check row numbers distribution
+        row_num_counts = with_row_nums.groupBy("row_num").count().orderBy("row_num")
+        print("DEBUG: Row number distribution:")
+        row_num_counts.show(10, truncate=False)
+        
+        # Filter to only get the most recent version of each record
+        latest_records = with_row_nums.filter(col("row_num") == 1).drop("row_num")
+        latest_count = latest_records.count()
+        print(f"DEBUG: Latest records count (one per {primary_key_field}): {latest_count}")
+        
+        # Filter out deleted records
+        active_records = latest_records.filter(col("is_deleted") == False)
+        active_count = active_records.count()
+        print(f"Loaded {active_count} active {entity_name} records (after filtering duplicates and deleted records)")
+        
+        return active_records
+    except Exception as e:
+        print(f"Error loading latest data for {entity_name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+def load_or_create_checkpoint(spark, checkpoint_path, entity_name):
+    """
+    Load the latest checkpoint information or create a new one if it doesn't exist.
+    Returns the latest processed timestamp.
+    """
+    checkpoint_file = f"{checkpoint_path}/{entity_name}_checkpoint.parquet"
     
-    return df
+    try:
+        # Try to read the checkpoint
+        checkpoint_df = spark.read.parquet(checkpoint_file)
+        last_processed_ts = checkpoint_df.select("last_processed_timestamp").first()[0]
+        print(f"Loaded checkpoint for {entity_name}: Last processed timestamp = {last_processed_ts}")
+        return last_processed_ts
+    except:
+        print(f"No checkpoint found for {entity_name}, creating a new one with epoch start")
+        # Return timestamp 0 (epoch start) if no checkpoint exists
+        return 0
+
+def save_checkpoint(spark, checkpoint_path, entity_name, last_processed_ts):
+    """Save the checkpoint information with the latest processed timestamp."""
+    checkpoint_file = f"{checkpoint_path}/{entity_name}_checkpoint.parquet"
+    
+    # Create dataframe with checkpoint info and explicit schema
+    from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
+    import datetime
+    
+    # Get current time as Python datetime object
+    current_time = datetime.datetime.now()
+    
+    schema = StructType([
+        StructField("entity_name", StringType(), False),
+        StructField("last_processed_timestamp", LongType(), False),
+        StructField("checkpoint_created_at", TimestampType(), False)
+    ])
+    
+    checkpoint_df = spark.createDataFrame(
+        [(entity_name, last_processed_ts, current_time)], 
+        schema
+    )
+    
+    # Save the checkpoint
+    checkpoint_df.write.mode("overwrite").parquet(checkpoint_file)
+    print(f"Saved checkpoint for {entity_name}: Last processed timestamp = {last_processed_ts}")
+
+def process_raw_data(spark, entity_name, raw_path, processed_path, checkpoint_path=None):
+    """
+    Process the raw CDC data into a cleaned format for analytics.
+    With direct handling for PostgreSQL binary numeric types using a UDF.
+    
+    If checkpoint_path is provided, only process data newer than the last checkpoint.
+    
+    Returns:
+        bool: True if processing succeeded, False otherwise
+    """
+    
+    # Determine if we're doing incremental processing
+    incremental = checkpoint_path is not None
+    
+    if incremental:
+        # Get the last processed timestamp
+        last_processed_ts = load_or_create_checkpoint(spark, checkpoint_path, entity_name)
+    else:
+        last_processed_ts = None
+
+    # Create a UDF (User-Defined Function) to directly convert PostgreSQL binary to numeric values
+    @udf(returnType=DoubleType())
+    def pg_numeric_to_double(binary_data):
+        if binary_data is None:
+            return None
+        
+        try:
+            # Convert binary data to integer based on number of bytes
+            value = int.from_bytes(binary_data, byteorder='big')
+            
+            # Apply fixed scaling factor for 2 decimal places
+            return value / 100.0
+        except Exception as e:
+            print(f"Error converting numeric: {e}")
+            return None
+    
+    full_path = f"{raw_path}/{entity_name}"
+    output_path = f"{processed_path}/{entity_name}"
+    
+    if incremental:
+        print(f"Processing {entity_name} data from {full_path} with timestamp > {last_processed_ts}...")
+    else:
+        print(f"Processing all {entity_name} data from {full_path}...")
+    
+    try:
+        # Read the raw data from MinIO
+        try:
+            raw_df = spark.read.format("parquet").load(full_path)
+        except Exception as e:
+            print(f"Error reading data from {full_path}: {str(e)}")
+            return False
+        
+        # Filter only new data if doing incremental processing
+        if incremental:
+            df = raw_df.filter(col("__source_ts_ms") > last_processed_ts)
+            
+            # Check if there's any new data to process
+            count = df.count()
+            if count == 0:
+                print(f"No new data to process for {entity_name} since last checkpoint")
+                return True  # Return success as this is not an error
+            print(f"Processing {count} new records for {entity_name}")
+        else:
+            df = raw_df
+        
+        # Add processing timestamp
+        processed_df = df.withColumn("processing_time", current_timestamp())
+        
+        # Replace deleted flag with proper boolean
+        processed_df = processed_df.withColumn(
+            "is_deleted", 
+            when(col("__deleted") == "true", lit(True)).otherwise(lit(False))
+        )
+        
+        # Convert CDC timestamp to actual timestamp
+        processed_df = processed_df.withColumn(
+            "cdc_timestamp", 
+            to_timestamp(col("__source_ts_ms") / 1000)
+        )
+        
+        # Convert timestamps fields if present
+        if "registration_date" in df.columns:
+            processed_df = processed_df.withColumn(
+                "registration_date", 
+                to_timestamp(col("registration_date") / 1000000)
+            )
+        
+        if "last_update" in df.columns:
+            processed_df = processed_df.withColumn(
+                "last_update", 
+                to_timestamp(col("last_update") / 1000000)
+            )
+        
+        if "order_date" in df.columns:
+            processed_df = processed_df.withColumn(
+                "order_date", 
+                to_timestamp(col("order_date") / 1000000)
+            )
+        
+        # Handle binary fields with previously defined UDF
+        if entity_name == "orders" and "total_amount" in df.columns:
+            processed_df = processed_df.withColumn(
+                "total_amount",
+                pg_numeric_to_double(col("total_amount"))
+            )
+        
+        if entity_name == "order_items":
+            if "unit_price" in df.columns:
+                processed_df = processed_df.withColumn(
+                    "unit_price",
+                    pg_numeric_to_double(col("unit_price"))
+                )
+            
+            if "discount" in df.columns:
+                processed_df = processed_df.withColumn(
+                    "discount",
+                    pg_numeric_to_double(col("discount"))
+                )
+        
+        # Write mode depends on whether we're doing incremental processing
+        write_mode = "append" if incremental else "overwrite"
+        
+        # Write to MinIO in Parquet format
+        (processed_df
+         .write
+         .mode(write_mode)
+         .format("parquet")
+         .partitionBy("__op")
+         .save(output_path))
+        
+        # Update checkpoint if doing incremental processing
+        if incremental:
+            max_ts = df.select(spark_max("__source_ts_ms")).first()[0]
+            save_checkpoint(spark, checkpoint_path, entity_name, max_ts)
+            
+        print(f"Successfully processed and saved {entity_name} data to {output_path}")
+        return True
+    
+    except Exception as e:
+        print(f"Error processing {entity_name} data: {str(e)}")
+        return False
 
 # price x quantity x (1 - discount)
 # This is a simple calculation to get the total line item price
@@ -239,114 +490,6 @@ def save_analytics_results(df, name, output_path):
     
     print(f"Saved analytics results for '{name}' to {output_path}")
 
-def process_raw_data(spark, entity_name, raw_path, processed_path):
-    """
-    Process the raw CDC data into a cleaned format for analytics.
-    With direct handling for PostgreSQL binary numeric types using a UDF.
-    
-    Returns:
-        bool: True if processing succeeded, False otherwise
-    """
-
-    # Create a UDF (User-Defined Function) to directly convert PostgreSQL binary to numeric values
-    @udf(returnType=DoubleType())
-    def pg_numeric_to_double(binary_data):
-        if binary_data is None:
-            return None
-        
-        try:
-            # Convert binary data to integer based on number of bytes
-            value = int.from_bytes(binary_data, byteorder='big')
-            
-            # Apply fixed scaling factor for 2 decimal places
-            return value / 100.0
-        except Exception as e:
-            print(f"Error converting numeric: {e}")
-            return None
-    
-    full_path = f"{raw_path}/{entity_name}"
-    output_path = f"{processed_path}/{entity_name}"
-    
-    print(f"Processing {entity_name} data from {full_path}...")
-    
-    try:
-        # Read the raw data from MinIO
-        try:
-            df = spark.read.format("parquet").load(full_path)
-        except Exception as e:
-            print(f"Error reading data from {full_path}: {str(e)}")
-            return False
-        
-        # Add processing timestamp
-        processed_df = df.withColumn("processing_time", current_timestamp())
-        
-        # Replace deleted flag with proper boolean
-        processed_df = processed_df.withColumn(
-            "is_deleted", 
-            when(col("__deleted") == "true", lit(True)).otherwise(lit(False))
-        )
-        
-        # Convert CDC timestamp to actual timestamp
-        processed_df = processed_df.withColumn(
-            "cdc_timestamp", 
-            to_timestamp(col("__source_ts_ms") / 1000)
-        )
-        
-        # Convert timestamps fields if present
-        if "registration_date" in df.columns:
-            processed_df = processed_df.withColumn(
-                "registration_date", 
-                to_timestamp(col("registration_date") / 1000000)
-            )
-        
-        if "last_update" in df.columns:
-            processed_df = processed_df.withColumn(
-                "last_update", 
-                to_timestamp(col("last_update") / 1000000)
-            )
-        
-        if "order_date" in df.columns:
-            processed_df = processed_df.withColumn(
-                "order_date", 
-                to_timestamp(col("order_date") / 1000000)
-            )
-        
-        # Handle binary fields with previously defined UDF
-        if entity_name == "orders" and "total_amount" in df.columns:
-            processed_df = processed_df.withColumn(
-                "total_amount",
-                pg_numeric_to_double(col("total_amount"))
-            )
-        
-        if entity_name == "order_items":
-            if "unit_price" in df.columns:
-                processed_df = processed_df.withColumn(
-                    "unit_price",
-                    pg_numeric_to_double(col("unit_price"))
-                )
-            
-            if "discount" in df.columns:
-                processed_df = processed_df.withColumn(
-                    "discount",
-                    pg_numeric_to_double(col("discount"))
-                )
-        
-        # Write to MinIO in Parquet format
-        (processed_df
-         .write
-        # TODO: Deal with incremental processing, so we don't process entire data every time
-         .mode("overwrite")
-         .format("parquet")
-         .partitionBy("__op")
-         .save(output_path))
-        
-        print(f"Successfully processed and saved {entity_name} data to {output_path}")
-        return True
-    
-    except Exception as e:
-        print(f"Error processing {entity_name} data: {str(e)}")
-        return False
-
 def main():
     # Create Spark session
     spark = create_spark_session()
@@ -356,6 +499,10 @@ def main():
     data_lake_raw_path = "s3a://datalake/raw"
     data_lake_processed_path = "s3a://datalake/processed"
     analytics_output_path = "s3a://datalake"
+    checkpoint_path = "s3a://datalake/checkpoints"
+    
+    # Enable incremental processing
+    incremental_processing = True
     
     # Display S3 configuration for debugging
     print("S3/MinIO Configuration:")
@@ -374,7 +521,10 @@ def main():
         all_successful = True
         
         for entity in entities:
-            success = process_raw_data(spark, entity, data_lake_raw_path, data_lake_processed_path)
+            # Process raw data, using incremental if enabled
+            checkpoint_path_arg = checkpoint_path if incremental_processing else None
+            success = process_raw_data(spark, entity, data_lake_raw_path, 
+                                     data_lake_processed_path, checkpoint_path_arg)
             if success:
                 processed_entities.append(entity)
             else:
@@ -386,11 +536,37 @@ def main():
             print("ERROR: Not all required entities were processed successfully.")
             sys.exit(1)
         
+        # Debug: Before loading data, check files in processed path
+        print("\nDEBUG: Checking processed data files:")
+        for entity in processed_entities:
+            try:
+                # Count partitions and files
+                path = f"{data_lake_processed_path}/{entity}"
+                df = spark.read.format("parquet").load(path)
+                total_count = df.count()
+                partition_count = df.select("__op").distinct().count()
+                
+                print(f"Entity: {entity}")
+                print(f"  Total records: {total_count}")
+                print(f"  Distinct operations: {partition_count}")
+                
+                # Show operation types and counts
+                print("  Operation counts:")
+                df.groupBy("__op").count().show(truncate=False)
+                
+                # Check 'is_deleted' distribution
+                print("  Deleted status counts:")
+                df.groupBy("is_deleted").count().show(truncate=False)
+            except Exception as e:
+                print(f"  Error examining {entity} files: {str(e)}")
+        
         # Now load the processed data for analytics
+        print("\nLoading processed data for analytics:")
         dataframes = {}
         
         for entity in processed_entities:
             try:
+                print(f"\nLoading {entity} data...")
                 dataframes[entity] = load_data_from_datalake(spark, entity, data_lake_processed_path)
                 print(f"Successfully loaded {entity} data with {dataframes[entity].count()} records")
             except Exception as e:
@@ -462,6 +638,8 @@ def main():
         
     except Exception as e:
         print(f"Error during analytics processing: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise
 
 if __name__ == "__main__":

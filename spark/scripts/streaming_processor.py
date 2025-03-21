@@ -6,7 +6,6 @@
 import os
 import time
 import json
-import uuid
 
 from datetime import datetime
 from pyspark.sql import SparkSession
@@ -115,14 +114,20 @@ def define_schemas():
 
 def read_kafka_topic(spark, topic, schema):
     """Read data from a Kafka topic with the specified schema."""
+    # Check if checkpoint exists and choose offset accordingly
+    checkpoint_path = f"/opt/bitnami/spark/checkpoints/{topic.replace('.', '_')}"
+    starting_offset = "latest" if os.path.exists(checkpoint_path) else "earliest"
+    
+    print(f"Starting offset for {topic}: {starting_offset} (checkpoint exists: {os.path.exists(checkpoint_path)})")
+    
     return (spark
             .readStream
             .format("kafka")
             # Kafka broker address
             .option("kafka.bootstrap.servers", "kafka:9092")
             .option("subscribe", topic)
-            # Start from the earliest available messages in the topic
-            .option("startingOffsets", "earliest")
+            # Use dynamic starting offset based on checkpoint existence
+            .option("startingOffsets", starting_offset)
             .load()
 
             # Read raw message from Kafka as JSON
@@ -156,9 +161,10 @@ def process_and_save_to_minio(df, entity_name):
     # Define the MinIO output path
     s3_path = f"s3a://datalake/raw/{entity_name}"
     
-    # Create a unique checkpoint path for each query to avoid conflicts
-    query_id = str(uuid.uuid4())[:8]  # Use a unique ID for each stream
-    checkpoint_path = f"/opt/bitnami/spark/checkpoints/{entity_name}_{query_id}"
+    # Use a UNIQUE checkpoint path for each entity
+    # Include timestamp to ensure uniqueness if we restart the application
+    checkpoint_timestamp = int(datetime.now().timestamp())
+    checkpoint_path = f"/opt/bitnami/spark/checkpoints/{entity_name}_{checkpoint_timestamp}"
     
     # Create a tracking file to monitor data written to data lake
     tracking_dir = "/opt/bitnami/spark/tracking"
@@ -168,44 +174,72 @@ def process_and_save_to_minio(df, entity_name):
     # Initialize tracking file if it doesn't exist
     if not os.path.exists(tracking_file):
         with open(tracking_file, 'w') as f:
-            json.dump({"last_batch_id": -1, "total_records_written": 0}, f)
+            json.dump({"last_batch_id": -1, "total_records_written": 0, "processed_lsns": []}, f)
     
     # Add a foreach batch to monitor progress and track writes to data lake
     def process_batch(batch_df, batch_id):
-        # Count records in the batch
-        row_count = batch_df.count()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Read current tracking info
+        tracking_info = {"last_batch_id": -1, "total_records_written": 0, "processed_lsns": []}
+        if os.path.exists(tracking_file):
+            with open(tracking_file, 'r') as f:
+                try:
+                    tracking_info = json.load(f)
+                    if "processed_lsns" not in tracking_info:  # Handle backward compatibility
+                        tracking_info["processed_lsns"] = []
+                except:
+                    pass
         
-        if row_count > 0:
-            # Actually write the data to MinIO
-            # Partition by operation type
-            (batch_df
-             .write
-             .partitionBy("__op")
-             .mode("append")
-             .parquet(s3_path))
+        # Collect LSNs from this batch to check for duplicates
+        # LSN (Log Sequence Number) is a unique identifier for each CDC event
+        batch_lsns = [row["__lsn"] for row in batch_df.select("__lsn").collect()]
+        
+        # Enhanced debugging - display more info about the batch and LSNs
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Batch {batch_id} contains {len(batch_lsns)} records with LSNs: {batch_lsns[:5]}...")
+        print(f"[{timestamp}] Already processed LSNs (sample): {tracking_info['processed_lsns'][:5]}...")
+        
+        # Filter out records we've already processed
+        new_lsns = [lsn for lsn in batch_lsns if lsn not in tracking_info["processed_lsns"]]
+        print(f"[{timestamp}] New LSNs to process: {new_lsns[:5]}...")
+        
+        # If we have new records to process
+        if new_lsns:
+            # Filter the DataFrame to only include new records
+            filtered_df = batch_df.filter(col("__lsn").isin(new_lsns))
+            row_count = filtered_df.count()
             
-            # Update tracking information
-            tracking_info = {"last_batch_id": batch_id, "total_records_written": 0}
-            if os.path.exists(tracking_file):
-                with open(tracking_file, 'r') as f:
-                    try:
-                        tracking_info = json.load(f)
-                    except:
-                        pass
-            
-            # Update total count
-            tracking_info["last_batch_id"] = batch_id
-            tracking_info["total_records_written"] += row_count
-            
-            # Save tracking info
-            with open(tracking_file, 'w') as f:
-                json.dump(tracking_info, f)
-            
-            # Log the write operation
-            print(f"[{timestamp}] WROTE TO DATALAKE: {row_count} {entity_name} records (batch #{batch_id})")
-            print(f"[{timestamp}] Total {entity_name} records in data lake: {tracking_info['total_records_written']}")
-            print(f"[{timestamp}] Data location: {s3_path}/__op=*")
+            if row_count > 0:
+                # Actually write the data to MinIO
+                # Partition by operation type
+                (filtered_df
+                 .write
+                 .partitionBy("__op")
+                 .mode("append")
+                 .parquet(s3_path))
+                
+                # Update total count
+                tracking_info["last_batch_id"] = batch_id
+                tracking_info["total_records_written"] += row_count
+                
+                # Add the processed LSNs to our tracking
+                tracking_info["processed_lsns"].extend(new_lsns)
+                
+                # Sort LSNs numerically before truncating to ensure we keep the highest ones
+                if len(tracking_info["processed_lsns"]) > 10000:
+                    tracking_info["processed_lsns"] = sorted(tracking_info["processed_lsns"])[-10000:]
+                
+                # Save tracking info
+                with open(tracking_file, 'w') as f:
+                    json.dump(tracking_info, f)
+                
+                # Log the write operation
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{timestamp}] WROTE TO DATALAKE: {row_count} {entity_name} records (batch #{batch_id})")
+                print(f"[{timestamp}] Total {entity_name} records in data lake: {tracking_info['total_records_written']}")
+                print(f"[{timestamp}] Data location: {s3_path}/__op=*")
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] Skipped {len(batch_lsns)} duplicate {entity_name} records (batch #{batch_id})")
     
     # Write to MinIO in Parquet format using foreachBatch
     query = (processed_df
