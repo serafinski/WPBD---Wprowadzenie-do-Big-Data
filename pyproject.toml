@@ -1,21 +1,14 @@
-[tool.poetry]
-name = "wpbd"
+[project]
+name = "wpbd-wprowadzenie-do-big-data"
 version = "0.1.0"
-description = ""
-authors = ["Tomasz Serafiński <work.serafinski@gmail.com>"]
+description = "Add your description here"
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.9"
-sqlalchemy = "^2.0.38"
-sqlalchemy-utils = "^0.41.2"
-faker = "^36.1.1"
-pg8000 = "^1.31.2"
-requests = "^2.32.3"
-pyspark = "^3.5.5"
-
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
+requires-python = ">=3.11"
+dependencies = [
+    "faker>=37.1.0",
+    "pg8000>=1.31.2",
+    "pyspark>=3.5.5",
+    "requests>=2.32.3",
+    "sqlalchemy>=2.0.40",
+    "sqlalchemy-utils>=0.41.2",
+]
